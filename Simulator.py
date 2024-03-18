@@ -1,29 +1,122 @@
 import cv2 as cv
 import numpy as np
 import copy
+import random
+import torch
+import torch.nn as nn
+from ParticleFilter import ParticleFilter
 
 class Simulator:
-    def __init__(self, map_img_file) -> None:
+    def __init__(self, map_img_file, N=1000, obs_size=100, dist_sim_weight=0.8, K=100, device='cpu', error_thresh=0.05) -> None:
         self.map = cv.imread(map_img_file)
+        self.file = map_img_file
         self.pixels_per_unit = 50
-        self.obs_size = 100
+        self.obs_size = obs_size
+        self.padded_map = cv.copyMakeBorder(self.map, self.obs_size, self.obs_size, self.obs_size, self.obs_size, cv.BORDER_CONSTANT, value=[0, 0, 0])
         self.range_x = self.map.shape[1] / self.pixels_per_unit
         self.min_x = - self.range_x / 2
-        self.max_x = self.range_x / 2
+        self.max_x = self.range_x / 2 - 1
         self.range_y = self.map.shape[0] / self.pixels_per_unit
         self.min_y = - self.range_y / 2
-        self.max_y = self.range_y / 2
+        self.max_y = self.range_y / 2 - 1
+        self.filter = ParticleFilter(N=N, min_x=self.min_x, max_x=self.max_x, min_y=self.min_y, max_y=self.max_y, device=device)
+        self.K = K
+        self.dist_sim_weight = dist_sim_weight
+        self.dir = self.file.split(".")[0]
+        self.error_thresh = error_thresh
 
-    def simulate(self):
+    def simulate(self, show_img=False):
         """Simulate moving until user presses q
+        Args:
+            particles (np.array): particles to be drawn on the map
         """
+        # document the change in error
+        errors = []
         coords = self.random_start()
-        key, _ = self.circle_true_location(coords)
-        while key != ord("q"):
-            key, coords = self.step(coordinates=coords)
+        _ = self.circle_particles()
+        _ = self.circle_location(coords, radius=int(self.range_x*self.pixels_per_unit//50), thickness=int(max(3, self.range_x//10)))
+        i = 0
+        if show_img:
+            cv.imshow(f"step {i}", self.map)
+            key = cv.waitKey(0)
+        while i < self.K:
+            # reset the map
+            self.map = cv.imread(self.file)
+            coords, _ = self.step(coordinates=coords)
+            # get a gps reading
+            reading = self.gps(coords=coords)
+            #print(f"true coords: {coords}   reading: {reading}")
+            # observe image at each particle
+            imgs = [self.observe(p) for p in self.filter.particles]
+            self.filter.update_weights(imgs=imgs, ref_img=self.observe(coords), gps_reading=reading, dist_sim_weight=self.dist_sim_weight)
+            error = self.eval(coordinates=coords)
+            errors.append(error)
+            # if error <= self.error_thresh:
+            #     break
+            # draw circles for particles with updated weights
+            self.circle_particles()
+            self.circle_location(coords, radius=int(self.range_x*self.pixels_per_unit//50), thickness=int(max(3, self.range_x//10)))
+            if show_img:
+                cv.imshow(f"step {i}: weights", self.map)
+                key = cv.waitKey(0)
+                if key == ord("q"):
+                    break
+            if i % 10 == 0:cv.imwrite(f"{self.dir}/obssize{self.obs_size}_pnum{self.filter.num_particles}_scoreweight{self.dist_sim_weight}_step{i}weights.png", self.map)
+            # resample particles
+            self.map = cv.imread(self.file)
+            self.filter.resample(weights=self.filter.weights)
+            self.circle_particles()
+            self.circle_location(coords, radius=int(self.range_x*self.pixels_per_unit//50), thickness=int(max(3, self.range_x//4)))
+            if i % 10 == 0:cv.imwrite(f"{self.dir}/obssize{self.obs_size}_pnum{self.filter.num_particles}_scoreweight{self.dist_sim_weight}_step{i}resampled.png", self.map)
+            if show_img:
+                cv.imshow(f"step {i}: resampled particles", self.map)
+                key = cv.waitKey(0)
+                if key == ord("q"):
+                    break
+            
+            i += 1
+            
+        return errors
+            
     
-    def step(self, coordinates:np.array) -> tuple[int, np.array]:
-        """move one step and circle the true location
+    def eval(self, coordinates:np.array):
+        """Evaluate the fitness of the current particles
+
+        Args:
+            coordiantes (np.array): current true location
+        """
+        # find the top 10% highest similarity indices, essentially kNN
+        k = int(self.filter.num_particles * 0.1)
+        _, indices = torch.topk(self.filter.weights, k)
+        # get the top 10% most similar particles
+        topk_particles = torch.tensor(self.filter.particles[indices])
+        true_location = torch.tensor(coordinates).expand_as(topk_particles)
+        criterion = nn.MSELoss()
+        mse = criterion(topk_particles.float(), true_location.float())
+        return mse.item()
+    
+    
+    def gps(self, coords:np.array, scale=0.5):
+        """generate a noisy gps reading
+
+        Args:
+            coords (np.array): true location
+        """
+        new_loc = np.array([float("inf"), float("inf")])
+        while not self.valid_location_check(new_loc):
+            noise = np.random.normal(loc=0.0, scale=scale, size=(2,))
+            new_loc = coords + noise
+        return new_loc
+        
+    
+    def inspect(self, imgs):
+        for i, img in enumerate(imgs):
+            cv.imshow(f"particle{i}", img)
+            cv.waitKey(0)
+
+    
+    def step(self, coordinates:np.array) -> tuple[int, np.array, np.array]:
+        """move one step and circle the true location and particles
 
         Args:
             coordinates (np.array): current location
@@ -32,25 +125,31 @@ class Simulator:
 
             np.array: new location
         """
-        coordinates = self.move(coordinates)
-        key, _ = self.circle_true_location(coordinates)
-        return key, coordinates
+        coordinates, move_vector = self.move(coordinates)
+        self.filter.move(move_vector=move_vector)
+        return coordinates, move_vector
     
-    def circle_true_location(self, true_coordinates:np.array):
-        if not self.valid_location_check(true_coordinates):
+    def circle_particles(self):
+        """draw a circle for each particle
+        """
+        for p, weight in zip(self.filter.particles, self.filter.weights):
+            self.circle_location(coords=p, radius=int(max(1, (self.range_x*self.pixels_per_unit*weight//50))), color=(180, 105, 255), thickness=int(min(5, self.range_x//4)))
+        return self.map
+
+    
+    def circle_location(self, coords:np.array, radius=20, color=(255, 255, 0), thickness=3):
+        if not self.valid_location_check(coords):
             raise Exception("location out of bounds")
 
         # Convert from units to pixels to match the image's coordinate system
-        pixel_coords = self._coordinates_to_pixels(true_coordinates)
+        pixel_coords = self._coordinates_to_pixels(coords)
 
         # Draw the circle on the map
-        tmp_map = copy.deepcopy(self.map)
-        cv.circle(tmp_map, (pixel_coords[0], pixel_coords[1]), radius=40, color=(255, 0, 255), thickness=20)
-        cv.imshow("true location", tmp_map)
-        key = cv.waitKey(0)
-        return key, tmp_map
+        cv.circle(self.map, (pixel_coords[0], pixel_coords[1]), radius=radius, color=color, thickness=thickness)
+        return self.map
     
-    def move(self, prev_coordinates:np.array) -> np.array:
+    
+    def move(self, prev_coordinates:np.array) -> tuple[np.array, np.array]:
         """move for one time step
 
         Args:
@@ -64,7 +163,7 @@ class Simulator:
             rand_move_vecor = self.random_move_vector()
             noise = np.random.normal(0, 0.1, size=(2,))
             new_loc = prev_coordinates + rand_move_vecor + noise
-        return new_loc
+        return new_loc, rand_move_vecor
     
     def random_start(self):
         """Generate a random start (x, y)
@@ -84,7 +183,8 @@ class Simulator:
         
         dx = np.random.uniform(low=-1.0, high=1.0)
         dy = np.sqrt(1.0 - dx**2)
-        return np.array([dx, dy])
+        choices = np.array([np.array([dx, dy]), np.array([dx, -dy])])
+        return random.choice(choices)
 
     def observe(self, coordinates:np.array):
         """observe the image at x, y
@@ -93,7 +193,7 @@ class Simulator:
             coordinates (float): current x, y
 
         Returns:
-            image: an image that's self.o
+            image: an image that is a section of the map
         """
         if not self.valid_location_check(coordinates):
             raise Exception("coordiantes out of bounds")
@@ -101,11 +201,11 @@ class Simulator:
         pixel_coords = self._coordinates_to_pixels(coordinates)
 
         # Calculate the top-left corner of the sub-image
-        start_x = pixel_coords[0] - self.obs_size // 2
-        start_y = pixel_coords[1] - self.obs_size // 2
+        start_x = int(pixel_coords[0] - self.obs_size // 2 - ( - self.obs_size))
+        start_y = int(pixel_coords[1] - self.obs_size // 2 - ( - self.obs_size))
 
         # Extract the sub-image using slicing
-        sub_image = self.map[start_y:start_y + self.obs_size, start_x:start_x + self.obs_size]
+        sub_image = self.padded_map[start_y:start_y + self.obs_size, start_x:start_x + self.obs_size]
 
         return sub_image
     
@@ -113,17 +213,17 @@ class Simulator:
         """check whether the x, y location is within bounds
 
         Args:
-            coordinates (float): current x, y
+            coordinates (np.array): current x, y
 
         Returns:
             bool: True if within bounds and False otherwise
         """
         x, y = coordinates[0], coordinates[1]
         if not self.min_x <= x <= self.max_x:
-            print("x coordinate out of bounds")
+            #print("x coordinate out of bounds")
             return False
         if not self.min_y <= y <= self.max_y:
-            print("y coordinate out of bounds")
+            #print("y coordinate out of bounds")
             return False
         return True
     
@@ -143,5 +243,9 @@ class Simulator:
 
 
 if __name__=="__main__":
-    simulator = Simulator(map_img_file="MarioMap.png")
-    simulator.simulate()
+    simulator = Simulator(map_img_file="BayMap.png", N=1000, K=60)
+    simulator.simulate(show_img=False)
+    simulator = Simulator(map_img_file="CityMap.png", N=1000, K=60)
+    simulator.simulate(show_img=False)
+    simulator = Simulator(map_img_file="MarioMap.png", N=1000, K=60)
+    simulator.simulate(show_img=False)
