@@ -4,10 +4,12 @@ import copy
 import random
 import torch
 import torch.nn as nn
+import os
+from pathlib import Path
 from ParticleFilter import ParticleFilter
 
 class Simulator:
-    def __init__(self, map_img_file, N=1000, obs_size=100, dist_sim_weight=0.8, K=100, device='cpu', error_thresh=0.05) -> None:
+    def __init__(self, map_img_file, N=1000, obs_size=100, dist_sim_weight=0.8, K=100, device='cpu', error_thresh=0.05, white_noise=0.0) -> None:
         self.map = cv.imread(map_img_file)
         self.file = map_img_file
         self.pixels_per_unit = 50
@@ -24,12 +26,16 @@ class Simulator:
         self.dist_sim_weight = dist_sim_weight
         self.dir = self.file.split(".")[0]
         self.error_thresh = error_thresh
+        self.white_noise = white_noise
 
     def simulate(self, show_img=False):
         """Simulate moving until user presses q
         Args:
             particles (np.array): particles to be drawn on the map
         """
+        # save images in this directory
+        dir = Path(f"{self.dir}/obs_size{self.obs_size}/pnum{self.filter.num_particles}/score_weight{self.dist_sim_weight}/noise{self.white_noise}")
+        dir.mkdir(parents=True, exist_ok=True)
         # document the change in error
         errors = []
         coords = self.random_start()
@@ -48,7 +54,7 @@ class Simulator:
             #print(f"true coords: {coords}   reading: {reading}")
             # observe image at each particle
             imgs = [self.observe(p) for p in self.filter.particles]
-            self.filter.update_weights(imgs=imgs, ref_img=self.observe(coords), gps_reading=reading, dist_sim_weight=self.dist_sim_weight)
+            self.filter.update_weights(imgs=imgs, ref_img=self.add_white_noise(self.observe(coords), level=self.white_noise), gps_reading=reading, dist_sim_weight=self.dist_sim_weight)
             error = self.eval(coordinates=coords)
             errors.append(error)
             # if error <= self.error_thresh:
@@ -61,13 +67,13 @@ class Simulator:
                 key = cv.waitKey(0)
                 if key == ord("q"):
                     break
-            if i % 10 == 0:cv.imwrite(f"{self.dir}/obssize{self.obs_size}_pnum{self.filter.num_particles}_scoreweight{self.dist_sim_weight}_step{i}weights.png", self.map)
+            if i % 10 == 0:cv.imwrite(str(dir/f"step{i}weights.png"), self.map)
             # resample particles
             self.map = cv.imread(self.file)
             self.filter.resample(weights=self.filter.weights)
             self.circle_particles()
             self.circle_location(coords, radius=int(self.range_x*self.pixels_per_unit//50), thickness=int(max(3, self.range_x//4)))
-            if i % 10 == 0:cv.imwrite(f"{self.dir}/obssize{self.obs_size}_pnum{self.filter.num_particles}_scoreweight{self.dist_sim_weight}_step{i}resampled.png", self.map)
+            if i % 10 == 0:cv.imwrite(str(dir/f"step{i}resampled.png"), self.map)
             if show_img:
                 cv.imshow(f"step {i}: resampled particles", self.map)
                 key = cv.waitKey(0)
@@ -95,8 +101,24 @@ class Simulator:
         mse = criterion(topk_particles.float(), true_location.float())
         return mse.item()
     
+    # EXTRA CREDIT 3: adding noise to reference image
+    def add_white_noise(self, img, level):
+        """Add Gaussian noise to image
+
+        Args:
+            img (MatLike): image
+            level (float): noise level
+        """
+        h, w, c = img.shape
+        if level > 0.0:
+            noise = np.random.normal(0, level, size=(h, w, c))*255
+            noisy_img = cv.add(img, noise.astype(np.uint8))
+            return noisy_img
+        else:
+            return img
+
     
-    def gps(self, coords:np.array, scale=0.5):
+    def gps(self, coords:np.array, scale=1.0):
         """generate a noisy gps reading
 
         Args:
@@ -243,9 +265,21 @@ class Simulator:
 
 
 if __name__=="__main__":
-    simulator = Simulator(map_img_file="BayMap.png", N=1000, K=60)
-    simulator.simulate(show_img=False)
-    simulator = Simulator(map_img_file="CityMap.png", N=1000, K=60)
-    simulator.simulate(show_img=False)
-    simulator = Simulator(map_img_file="MarioMap.png", N=1000, K=60)
-    simulator.simulate(show_img=False)
+    # test if white noise is working
+    simulator = Simulator(map_img_file="BayMap.png", N=1000, K=60, obs_size=500, white_noise=0.0)
+    img = simulator.observe((0,0))
+    noisy_img = simulator.add_white_noise(img, level=0.0)
+    cv.imshow('no noise', noisy_img)
+    cv.waitKey(0)
+    noisy_img = simulator.add_white_noise(img, level=0.25)
+    cv.imshow('25', noisy_img)
+    cv.waitKey(0)
+    noisy_img = simulator.add_white_noise(img, level=0.5)
+    cv.imshow('50', noisy_img)
+    cv.waitKey(0)
+    noisy_img = simulator.add_white_noise(img, level=0.75)
+    cv.imshow('75', noisy_img)
+    cv.waitKey(0)
+    noisy_img = simulator.add_white_noise(img, level=1)
+    cv.imshow('1', noisy_img)
+    cv.waitKey(0)

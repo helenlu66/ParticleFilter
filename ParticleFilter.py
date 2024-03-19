@@ -136,7 +136,7 @@ class ParticleFilter:
         Returns:
             torch.Tensor: list of resampled particles
         """
-        new_particles = self._roulette_resample(weights=weights, percent=0.999)
+        new_particles = self._roulette_resample(weights=weights, percent=0.95)
         new_rand_particles = self._initialize_particles()[:int(len(self.particles)*0.05)]
         # add some number of random particles
         self.particles = np.concatenate((new_particles, new_rand_particles), axis=0)[:self.num_particles]
